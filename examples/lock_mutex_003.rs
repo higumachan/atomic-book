@@ -1,7 +1,7 @@
 // lockされていて待機者がいない状態といる状態を分ける
 use atomic_wait::{wait, wake_one};
 use std::cell::UnsafeCell;
-use std::hint::black_box;
+use std::hint::{black_box, spin_loop};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
@@ -17,6 +17,7 @@ struct Mutex<T> {
 unsafe impl<T> Sync for Mutex<T> where T: Send {}
 
 impl<T> Mutex<T> {
+    #[inline]
     fn new(value: T) -> Self {
         Self {
             state: AtomicU32::new(0),
@@ -24,17 +25,37 @@ impl<T> Mutex<T> {
         }
     }
 
+    #[inline]
     fn lock(&self) -> MutexGuard<T> {
         if self
             .state
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            while self.state.swap(2, Ordering::Acquire) != 0 {
-                wait(&self.state, 2);
-            }
+            lock_contended(&self.state)
         }
         MutexGuard { mutex: self }
+    }
+}
+
+#[cold]
+fn lock_contended(state: &AtomicU32) {
+    let mut spin_counter = 0;
+
+    while state.load(Ordering::Relaxed) == 1 && spin_counter < 100 {
+        spin_counter += 1;
+        spin_loop();
+    }
+
+    if state
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+    {
+        return;
+    }
+
+    while state.swap(2, Ordering::Acquire) != 0 {
+        wait(&state, 2);
     }
 }
 
@@ -47,18 +68,21 @@ unsafe impl<T> Sync for MutexGuard<'_, T> where T: Sync {}
 impl<T> Deref for MutexGuard<'_, T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.mutex.value.get() }
     }
 }
 
 impl<T> DerefMut for MutexGuard<'_, T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.mutex.value.get() }
     }
 }
 
 impl<T> Drop for MutexGuard<'_, T> {
+    #[inline]
     fn drop(&mut self) {
         if self.mutex.state.swap(0, Ordering::Release) == 2 {
             wake_one(&self.mutex.state);

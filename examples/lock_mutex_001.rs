@@ -96,6 +96,7 @@ fn main() {
             || {
                 for i in 0..1000_000_0 {
                     let mut c = black_box(counter.lock());
+                    black_box(&c);
                     *c += 1;
                 }
             }
